@@ -4,20 +4,19 @@ import (
 	"context"
 	"encoding/json"
 	"flag"
-	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"os"
+	"strings"
 
 	"github.com/gin-gonic/gin"
-	"github.com/go-redis/redis/v8"
+	"github.com/twmb/franz-go/pkg/kgo"
 )
 
 // Server 구조체 정의
 type Server struct {
-	RedisClient *redis.Client
-	Ctx         context.Context
+	KafkaClient *kgo.Client
 }
 
 // 요청 데이터를 구조체로 정의
@@ -29,28 +28,22 @@ type RequestPayload struct {
 }
 
 // NewServer: 서버 구조체 생성 및 Redis 연결 설정
-func NewServer(redisAddr string) (Server, error) {
-	rdb := redis.NewClient(&redis.Options{
-		Addr: redisAddr,
-		DB:   0, // 기본 DB
-	})
-
-	ctx := context.Background()
-
-	// Redis 연결 확인
-	_, err := rdb.Ping(ctx).Result()
+func NewServer(seeds []string) (*Server, error) {
+	client, err := kgo.NewClient(
+		kgo.ConsumerGroup("my-group-identifier"),
+		kgo.ConsumeTopics("foo"),
+	)
 	if err != nil {
-		return Server{}, fmt.Errorf("failed to connect to Redis at %s: %v", redisAddr, err)
+		return nil, err
 	}
 
-	return Server{
-		RedisClient: rdb,
-		Ctx:         ctx,
+	return &Server{
+		KafkaClient: client,
 	}, nil
 }
 
 // 요청 바디 읽기 및 RequestPayload 생성
-func (s Server) parseRequest(c *gin.Context) (RequestPayload, error) {
+func (s *Server) parseRequest(c *gin.Context) (RequestPayload, error) {
 	body, err := io.ReadAll(c.Request.Body)
 	if err != nil {
 		return RequestPayload{}, err
@@ -65,17 +58,18 @@ func (s Server) parseRequest(c *gin.Context) (RequestPayload, error) {
 }
 
 // Redis에 요청 데이터 저장
-func (s Server) pushToRedis(data RequestPayload) error {
+func (s *Server) produce(data RequestPayload) error {
 	jsonData, err := json.Marshal(data)
 	if err != nil {
 		return err
 	}
+	record := &kgo.Record{Topic: "foo", Value: jsonData}
 
-	return s.RedisClient.LPush(s.Ctx, "request_queue", jsonData).Err()
+	return s.KafkaClient.ProduceSync(context.Background(), record).FirstErr()
 }
 
 // 엔드포인트 핸들러 함수
-func (s Server) handleRequest(c *gin.Context) {
+func (s *Server) handleRequest(c *gin.Context) {
 	// 요청 데이터 처리
 	requestData, err := s.parseRequest(c)
 	if err != nil {
@@ -85,7 +79,7 @@ func (s Server) handleRequest(c *gin.Context) {
 	}
 
 	// Redis에 저장
-	if err := s.pushToRedis(requestData); err != nil {
+	if err := s.produce(requestData); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to push to Redis queue"})
 		slog.Error("Failed to push to Redis queue", slog.String("error", err.Error()))
 		return
@@ -98,20 +92,22 @@ func (s Server) handleRequest(c *gin.Context) {
 
 func main() {
 	// 명령줄 인수 처리
-	redisAddr := flag.String("redis", "localhost:6379", "Redis server address")
+	kafkaAddrRaw := flag.String("kafka address", "localhost:9092", "kafka server address")
 	flag.Parse()
+
+	kafkaAddr := strings.Split(*kafkaAddrRaw, ",")
 
 	// slog 기본 핸들러 설정 (표준 출력)
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 	slog.SetDefault(logger)
 
 	// Server 인스턴스 생성
-	server, err := NewServer(*redisAddr)
+	server, err := NewServer(kafkaAddr)
 	if err != nil {
 		slog.Error("Failed to initialize server", slog.String("error", err.Error()))
 		return
 	}
-	slog.Info("Connected to Redis", slog.String("address", *redisAddr))
+	slog.Info("Connected to kafka", slog.String("address", *kafkaAddrRaw))
 
 	// Gin 라우터 설정
 	r := gin.Default()
